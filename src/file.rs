@@ -4,6 +4,46 @@ use std::io::{self, ErrorKind, Read, Write};
 use std::sync::Arc;
 use std::thread;
 
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
+
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
+
+#[derive(Debug, PartialEq, Eq)]
+struct LogEntry {
+    payload: Vec<u8>,
+}
+
+impl LogEntry {
+    pub fn new(payload: Vec<u8>) -> Self {
+        Self { payload }
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let payload_len = self.payload.len() as u32;
+        let mut buffer = Vec::with_capacity(4 + self.payload.len());
+
+        buffer.extend_from_slice(&payload_len.to_be_bytes());
+        buffer.extend_from_slice(&self.payload);
+
+        buffer
+    }
+
+    pub fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
+        let mut len_bytes = [0u8; 4];
+
+        reader.read_exact(&mut len_bytes)?;
+
+        let payload_len = u32::from_be_bytes(len_bytes) as usize;
+        let mut payload = vec![0u8; payload_len];
+
+        reader.read_exact(&mut payload)?;
+
+        Ok(LogEntry { payload })
+    }
+}
+
 pub fn read_from_file(input_path: &str) -> Result<Vec<u8>, FileError> {
     let bytes = fs::read(input_path)?;
 
@@ -34,7 +74,6 @@ pub fn write_to_file(file_path: &str, content: &[u8]) -> Result<(), FileError> {
     file.sync_all()?;
     Ok(())
 }
-
 // This might be nonsense for now, but maybe useful later, i guess while backup or huge huge file writing. IDK....
 pub fn parallel_thread_writer(input_path: &str, data: &[u8]) -> Result<(), FileError> {
     if data.is_empty() {
@@ -78,8 +117,6 @@ pub fn parallel_thread_writer(input_path: &str, data: &[u8]) -> Result<(), FileE
         let handle = thread::spawn(move || -> Result<(), io::Error> {
             #[cfg(unix)]
             {
-                use std::os::unix::fs::FileExt;
-
                 file_clone.write_all_at(&chunk_data, offset)?;
             }
             #[cfg(windows)]
@@ -112,6 +149,7 @@ pub fn parallel_thread_writer(input_path: &str, data: &[u8]) -> Result<(), FileE
 
     Ok(())
 }
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -132,5 +170,15 @@ mod test {
         assert_eq!(result, content);
 
         fs::remove_file(file_path).expect("Failed to delete test file.");
+    }
+
+    #[test]
+    fn log_entry_serialization_roundtrip() {
+        let original_entry = LogEntry::new(b"WAL Entry in file".to_vec());
+
+        let serialized_entry = original_entry.serialize();
+        let mut reader = std::io::Cursor::new(serialized_entry);
+        let decoded_entry = LogEntry::deserialize(&mut reader).unwrap();
+        assert_eq!(original_entry, decoded_entry);
     }
 }
