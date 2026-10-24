@@ -1,6 +1,6 @@
 use crate::errors::FileError;
 use std::fs::{self, OpenOptions};
-use std::io::{self, ErrorKind, Read, Write};
+use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
 use std::sync::Arc;
 use std::thread;
 
@@ -62,7 +62,7 @@ pub fn read_from_file(input_path: &str) -> Result<Vec<u8>, FileError> {
     Ok(bytes)
 }
 
-pub fn append_to_file(file_path: &str, content: &[u8]) -> Result<(), FileError> {
+pub fn append_to_file(path: &str, content: &[u8]) -> Result<(), FileError> {
     // let mut file = match OpenOptions::new().create(true).append(true).open(file_path) {
     //     Ok(f) => f,
     //     Err(e) => {
@@ -70,10 +70,7 @@ pub fn append_to_file(file_path: &str, content: &[u8]) -> Result<(), FileError> 
     //     }
     // };
 
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(file_path)?;
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
 
     file.write_all(content)?;
     file.sync_all()?;
@@ -180,6 +177,27 @@ pub fn append_entry(path: &str, entry: &LogEntry) -> Result<(), FileError> {
     let data_to_be_appended = entry.serialize();
     append_to_file(path, &data_to_be_appended)
 }
+
+pub fn read_entries(path: &str) -> Result<Vec<LogEntry>, FileError> {
+    let file = fs::File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut entries = Vec::new();
+
+    loop {
+        if reader.fill_buf()?.is_empty() {
+            break; // file is cleanly empty
+        }
+
+        match LogEntry::deserialize(&mut reader) {
+            Ok(entry) => entries.push(entry),
+            Err(e) if e.kind() == ErrorKind::UnexpectedEof => break,
+            Err(e) if e.kind() == ErrorKind::InvalidData => return Err(FileError::CorruptedData),
+            Err(e) => return Err(FileError::Io(e)),
+        }
+    }
+
+    Ok(entries)
+}
 #[cfg(test)]
 mod test {
     use super::*;
@@ -195,6 +213,14 @@ mod test {
 
     fn entry(s: &str) -> LogEntry {
         LogEntry::new(s.as_bytes().to_vec())
+    }
+
+    // cuts 'n' bytes from end of file, trying to simulate crash mid-write
+    fn chop_tail(path: &str, n: u64) {
+        let len = fs::metadata(path).unwrap().len();
+
+        let file = OpenOptions::new().write(true).open(path).unwrap();
+        file.set_len(len - n).unwrap();
     }
 
     #[test]
@@ -266,6 +292,80 @@ mod test {
         expected.extend_from_slice(&entry2.serialize());
 
         assert_eq!(read_from_file(path).unwrap(), expected);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn read_entries_reads_entries_in_order() {
+        let p = temp_path("replay.log");
+        let path = p.to_str().unwrap();
+
+        for s in ["one", "two", "three"] {
+            append_entry(path, &entry(s)).unwrap();
+        }
+
+        assert_eq!(
+            read_entries(path).unwrap(),
+            vec![entry("one"), entry("two"), entry("three")]
+        );
+
+        fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn torn_payload_is_ignored() {
+        let p = temp_path("torn_payload.log");
+        let path = p.to_str().unwrap();
+
+        for s in ["one", "two", "three"] {
+            append_entry(path, &entry(s)).unwrap();
+        }
+
+        // cut 3 bytes of last entry
+        chop_tail(path, 3);
+
+        assert_eq!(
+            read_entries(path).unwrap(),
+            vec![entry("one"), entry("two")]
+        );
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn torn_header_is_ignored() {
+        let p = temp_path("torn_header.log");
+        let path = p.to_str().unwrap();
+
+        for s in ["one", "two", "three"] {
+            append_entry(path, &entry(s)).unwrap();
+        }
+
+        // cut 3 bytes of last entry
+        // three is 9 bytes, 4 header + 5 bytes, so cutting of 7 bytes leaves us with torn header
+        chop_tail(path, 7);
+
+        assert_eq!(
+            read_entries(path).unwrap(),
+            vec![entry("one"), entry("two")]
+        );
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn garbage_length_is_reported_as_corrupted_data() {
+        let p = temp_path("garbage_length.log");
+        let path = p.to_str().unwrap();
+
+        for s in ["one", "two", "three"] {
+            append_entry(path, &entry(s)).unwrap();
+        }
+
+        append_entry(path, &entry("entry")).unwrap();
+        append_to_file(path, &[0xFF, 0xFF, 0xFF, 0xFF]).unwrap();
+
+        assert!(matches!(read_entries(path), Err(FileError::CorruptedData)));
 
         fs::remove_file(path).unwrap();
     }
