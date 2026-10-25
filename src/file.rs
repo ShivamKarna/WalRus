@@ -1,5 +1,8 @@
+// HEADER : [crc][length]
+// Format : HEADER + payload
+
 use crate::errors::FileError;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
 use std::sync::Arc;
 use std::thread;
@@ -10,11 +13,57 @@ use std::os::unix::fs::FileExt;
 #[cfg(windows)]
 use std::os::windows::fs::FileExt;
 
+// Constants
 const MAX_ENTRY_SIZE: usize = 16 * 1024 * 1024;
-
+const HEADER_LEN: usize = 8; // crc (4 bytes) + len(4 bytes) , 
+//
 #[derive(Debug, PartialEq, Eq)]
 pub struct LogEntry {
     payload: Vec<u8>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Tail {
+    Clean,
+    Torn,
+}
+
+#[derive(Debug)]
+pub struct ScanResult {
+    pub entries: Vec<LogEntry>,
+    pub valid_len: u64,
+    pub tail: Tail,
+}
+
+pub fn scan(path: &str) -> Result<ScanResult, FileError> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut entries = Vec::<LogEntry>::new();
+    let mut valid_len: u64 = 0;
+
+    let tail = loop {
+        if reader.fill_buf()?.is_empty() {
+            break Tail::Clean;
+        }
+
+        match LogEntry::deserialize(&mut reader) {
+            Ok(entry) => {
+                valid_len += entry.encoded_len() as u64;
+                entries.push(entry)
+            }
+            Err(e) if e.kind() == ErrorKind::UnexpectedEof => break Tail::Torn,
+            Err(e) if e.kind() == ErrorKind::InvalidData => {
+                return Err(FileError::CorruptedData);
+            }
+            Err(e) => return Err(FileError::Io(e)),
+        }
+    };
+
+    Ok(ScanResult {
+        entries,
+        valid_len,
+        tail,
+    })
 }
 
 impl LogEntry {
@@ -22,32 +71,67 @@ impl LogEntry {
         Self { payload }
     }
 
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    pub fn encoded_len(&self) -> usize {
+        HEADER_LEN + self.payload.len()
+    }
+
     pub fn serialize(&self) -> Vec<u8> {
-        let payload_len = self.payload.len() as u32;
-        let mut buffer = Vec::with_capacity(4 + self.payload.len());
+        // length
+        // hasher builder and finalize crc
+        // take an empty buffer and extend it with crc, and len, and payload
+        let len_bytes = (self.payload.len() as u32).to_be_bytes();
 
-        buffer.extend_from_slice(&payload_len.to_be_bytes());
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&len_bytes);
+        hasher.update(&self.payload);
+        let crc = hasher.finalize();
+
+        let mut buffer = Vec::with_capacity(self.encoded_len());
+        buffer.extend_from_slice(&crc.to_be_bytes());
+        buffer.extend_from_slice(&len_bytes);
         buffer.extend_from_slice(&self.payload);
-
         buffer
     }
 
     pub fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
+        // deserialization order : [crc][len][payload]
+
+        // crc bytes
+        let mut crc_bytes = [0u8; 4];
+        reader.read_exact(&mut crc_bytes)?;
+        let stored_crc = u32::from_be_bytes(crc_bytes);
+
+        // len bytes
         let mut len_bytes = [0u8; 4];
-
         reader.read_exact(&mut len_bytes)?;
-
         let payload_len = u32::from_be_bytes(len_bytes) as usize;
 
         if payload_len > MAX_ENTRY_SIZE {
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
-                "entry length too large",
+                "entry length too large!!",
             ));
         }
-        let mut payload = vec![0u8; payload_len];
 
+        // payload bytes
+        let mut payload = vec![0u8; payload_len];
         reader.read_exact(&mut payload)?;
+
+        // re compute hash to match checksum, crc
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&len_bytes);
+        hasher.update(&payload);
+
+        if hasher.finalize() != stored_crc {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "checksum mismatched",
+            ));
+        }
 
         Ok(LogEntry { payload })
     }
@@ -172,31 +256,14 @@ pub fn parallel_thread_writer(input_path: &str, data: &[u8]) -> Result<(), FileE
     Ok(())
 }
 
-// core function
+// core functions
 pub fn append_entry(path: &str, entry: &LogEntry) -> Result<(), FileError> {
-    let data_to_be_appended = entry.serialize();
-    append_to_file(path, &data_to_be_appended)
+    let serialized_entry = entry.serialize();
+    append_to_file(path, &serialized_entry)
 }
 
 pub fn read_entries(path: &str) -> Result<Vec<LogEntry>, FileError> {
-    let file = fs::File::open(path)?;
-    let mut reader = BufReader::new(file);
-    let mut entries = Vec::new();
-
-    loop {
-        if reader.fill_buf()?.is_empty() {
-            break; // file is cleanly empty
-        }
-
-        match LogEntry::deserialize(&mut reader) {
-            Ok(entry) => entries.push(entry),
-            Err(e) if e.kind() == ErrorKind::UnexpectedEof => break,
-            Err(e) if e.kind() == ErrorKind::InvalidData => return Err(FileError::CorruptedData),
-            Err(e) => return Err(FileError::Io(e)),
-        }
-    }
-
-    Ok(entries)
+    Ok(scan(path)?.entries)
 }
 #[cfg(test)]
 mod test {
@@ -207,7 +274,7 @@ mod test {
         let mut p = std::env::temp_dir();
 
         p.push(format!("walrus_{}_{}", std::process::id(), name));
-        let _ = fs::remove_file(&p); // ignore error if it doesn't exist.
+        let _ = fs::remove_file(&p).unwrap(); // ignore error if it doesn't exist.
         p
     }
 
@@ -270,7 +337,7 @@ mod test {
 
     #[test]
     fn deserialize_rejects_huge_file() {
-        let mut reader = io::Cursor::new(vec![0xFF, 0xFF, 0xFF, 0xFF]);
+        let mut reader = io::Cursor::new(vec![0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF]);
         let err = LogEntry::deserialize(&mut reader).unwrap_err();
 
         assert_eq!(err.kind(), ErrorKind::InvalidData);
@@ -278,7 +345,7 @@ mod test {
 
     #[test]
     fn append_entry_appends_in_order() {
-        let p = temp_path("read.txt");
+        let p = temp_path("append_order.txt");
         let path = p.to_str().unwrap();
 
         let entry1 = LogEntry::new(Vec::from("Hello World From Entry 1"));
@@ -341,7 +408,7 @@ mod test {
             append_entry(path, &entry(s)).unwrap();
         }
 
-        // cut 3 bytes of last entry
+        // cut 7 bytes of last entry
         // three is 9 bytes, 4 header + 5 bytes, so cutting of 7 bytes leaves us with torn header
         chop_tail(path, 7);
 
