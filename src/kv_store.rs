@@ -9,7 +9,7 @@ use crate::{
 
 // Layer 1: log record (file.rs 'LogEntry')
 // it just frames the raw bytes
-//      [crc: u23][len : u32][payload : len bytes]  big-endian
+//      [crc: u32][len : u32][payload : len bytes]  big-endian
 
 // Layer 2 : operation (this file, 'Op')
 pub enum Op {
@@ -131,7 +131,76 @@ impl KvStore {
 #[cfg(test)]
 mod test {
     use super::*;
-    use std::fs;
+    use std::fs::{self};
 
-    // unit tests for above
+    fn temp_path(name: &str) -> String {
+        let mut p = std::env::temp_dir();
+        p.push(format!("walrus_store_{}_{}", std::process::id(), name));
+        let _ = fs::remove_file(&p);
+        p.to_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn values_survive_reopen() {
+        let path = temp_path("survive.log");
+        {
+            let mut store = KvStore::open(&path).unwrap();
+            store.set(b"name", b"walrus").unwrap();
+            store.set(b"lang", b"rust").unwrap();
+        } // store dropped here : the in-memory map is gone
+        let store = KvStore::open(&path).unwrap(); // rebuiltt from log
+        assert_eq!(store.get(b"name"), Some(b"walrus".as_slice()));
+        assert_eq!(store.get(b"lang"), Some(b"rust".as_slice()));
+
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn delete_survives_reopen() {
+        let path = temp_path("delete.log");
+        {
+            let mut store = KvStore::open(&path).unwrap();
+            store.set(b"a", b"1").unwrap();
+            store.delete(b"a").unwrap();
+        }
+
+        let store = KvStore::open(&path).unwrap();
+        assert_eq!(store.get(b"a"), None);
+
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn torn_tail_is_dropped_and_store_keeps_working() {
+        let path = temp_path("torn.log");
+
+        {
+            let mut store = KvStore::open(&path).unwrap();
+            store.set(b"a", b"1").unwrap();
+            store.set(b"b", b"2").unwrap();
+            store.set(b"c", b"3").unwrap();
+        }
+
+        // simulate a crash:  cut 3 bytes off the last entry
+        let len = fs::metadata(&path).unwrap().len();
+        let f = OpenOptions::new().write(true).open(&path).unwrap();
+
+        f.set_len(len - 3).unwrap();
+
+        {
+            let mut store = KvStore::open(&path).unwrap();
+            assert_eq!(store.get(b"a"), Some(b"1".as_slice()));
+            assert_eq!(store.get(b"b"), Some(b"2".as_slice()));
+            assert_eq!(store.get(b"c"), None); // torn entry was never written
+
+            store.set(b"d", b"4").unwrap(); // this must not land after garbage
+        }
+
+        let store = KvStore::open(&path).unwrap();
+
+        assert_eq!(store.get(b"d"), Some(b"4".as_slice()));
+        assert_eq!(store.get(b"c"), None);
+
+        fs::remove_file(&path).unwrap();
+    }
 }
