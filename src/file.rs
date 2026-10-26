@@ -15,8 +15,8 @@ use std::os::windows::fs::FileExt;
 
 // Constants
 const MAX_ENTRY_SIZE: usize = 16 * 1024 * 1024;
-const HEADER_LEN: usize = 8; // crc (4 bytes) + len(4 bytes) , 
-//
+const HEADER_LEN: usize = 8; // crc (4 bytes) + len(4 bytes) ,
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct LogEntry {
     payload: Vec<u8>,
@@ -274,7 +274,7 @@ mod test {
         let mut p = std::env::temp_dir();
 
         p.push(format!("walrus_{}_{}", std::process::id(), name));
-        let _ = fs::remove_file(&p).unwrap(); // ignore error if it doesn't exist.
+        let _ = fs::remove_file(&p); // ignore error if it doesn't exist.
         p
     }
 
@@ -314,11 +314,11 @@ mod test {
     }
 
     #[test]
-    fn creat_new_file_refuses_second_write() {
-        let p = temp_path("crate_new_exists.txt");
+    fn create_new_file_refuses_second_write() {
+        let p = temp_path("create_new_exists.txt");
         let path = p.to_str().unwrap();
 
-        let _ = create_new_file(path, &[1]);
+        create_new_file(path, &[1]).unwrap();
         let second = create_new_file(path, &[2]);
         assert!(matches!(second, Err(FileError::FileAlreadyExists(_))));
         assert_eq!(read_from_file(path).unwrap(), [1]);
@@ -430,9 +430,97 @@ mod test {
         }
 
         append_entry(path, &entry("entry")).unwrap();
-        append_to_file(path, &[0xFF, 0xFF, 0xFF, 0xFF]).unwrap();
+        append_to_file(path, &[0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF]).unwrap();
 
         assert!(matches!(read_entries(path), Err(FileError::CorruptedData)));
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn scan_clean_log() {
+        let p = temp_path("scan_clean");
+        let path = p.to_str().unwrap();
+
+        for s in ["one", "two", "three"] {
+            append_entry(path, &entry(s)).unwrap();
+        }
+
+        let scan_result = scan(path).unwrap();
+
+        let total: usize = ["one", "two", "three"]
+            .iter()
+            .map(|s| entry(s).encoded_len())
+            .sum();
+
+        assert_eq!(
+            scan_result.entries,
+            vec![entry("one"), entry("two"), entry("three")]
+        );
+        assert_eq!(scan_result.valid_len, total as u64);
+        assert_eq!(scan_result.tail, Tail::Clean);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn scan_torn_payload() {
+        let p = temp_path("scan_torn.log");
+        let path = p.to_str().unwrap();
+
+        for s in ["one", "two", "three"] {
+            append_entry(path, &entry(s)).unwrap();
+        }
+
+        chop_tail(path, 3);
+
+        let scan_result = scan(path).unwrap();
+
+        let good_len = entry("one").encoded_len() + entry("two").encoded_len();
+
+        assert_eq!(scan_result.entries, vec![entry("one"), entry("two")]);
+        assert_eq!(scan_result.valid_len, good_len as u64);
+        assert_eq!(scan_result.tail, Tail::Torn);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn scan_torn_header() {
+        let p = temp_path("scan_torn_header.log");
+        let path = p.to_str().unwrap();
+
+        for s in ["one", "two", "three"] {
+            append_entry(path, &entry(s)).unwrap();
+        }
+
+        chop_tail(path, entry("three").encoded_len() as u64 - 2);
+
+        let scan_result = scan(path).unwrap();
+
+        let good_len = entry("one").encoded_len() + entry("two").encoded_len();
+
+        assert_eq!(scan_result.entries.len(), 2);
+        assert_eq!(scan_result.valid_len, good_len as u64);
+        assert_eq!(scan_result.tail, Tail::Torn);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn flipped_payload_byte_read_as_corrupted_data() {
+        let p = temp_path("scan_torn_header.log");
+        let path = p.to_str().unwrap();
+
+        append_entry(path, &entry("hello")).unwrap();
+        let mut bytes = fs::read(path).unwrap();
+
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+
+        fs::write(path, &bytes).unwrap();
+
+        assert!(matches!(scan(path), Err(FileError::CorruptedData)));
 
         fs::remove_file(path).unwrap();
     }
