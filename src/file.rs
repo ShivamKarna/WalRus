@@ -509,7 +509,7 @@ mod test {
 
     #[test]
     fn flipped_payload_byte_read_as_corrupted_data() {
-        let p = temp_path("scan_torn_header.log");
+        let p = temp_path("flipped_payload.log");
         let path = p.to_str().unwrap();
 
         append_entry(path, &entry("hello")).unwrap();
