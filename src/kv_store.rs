@@ -1,3 +1,4 @@
+use std::fmt;
 use std::{collections::HashMap, fs::OpenOptions, path::Path};
 
 use crate::{
@@ -12,9 +13,25 @@ use crate::{
 //      [crc: u32][len : u32][payload : len bytes]  big-endian
 
 // Layer 2 : operation (this file, 'Op')
+
+#[derive(PartialEq, Eq)]
 pub enum Op {
     Set { key: Vec<u8>, val: Vec<u8> },
     Delete { key: Vec<u8> },
+}
+
+impl fmt::Debug for Op {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Op::Set { key, val } => write!(
+                f,
+                "Set({} => {}",
+                String::from_utf8_lossy(key),
+                String::from_utf8_lossy(val)
+            ),
+            Op::Delete { key } => write!(f, "Delete({})", String::from_utf8_lossy(key),),
+        }
+    }
 }
 
 impl Op {
@@ -200,6 +217,155 @@ mod test {
 
         assert_eq!(store.get(b"d"), Some(b"4".as_slice()));
         assert_eq!(store.get(b"c"), None);
+
+        fs::remove_file(&path).unwrap();
+    }
+
+    // Op test
+    #[test]
+    fn op_roundtrip() {
+        let ops = vec![
+            Op::Set {
+                key: b"name".to_vec(),
+                val: b"walrus".to_vec(),
+            },
+            Op::Set {
+                key: b"a".to_vec(),
+                val: vec![],
+            }, // empty value
+            Op::Set {
+                key: vec![],
+                val: b"v".to_vec(),
+            }, // empty key
+            Op::Delete {
+                key: b"name".to_vec(),
+            },
+        ];
+
+        for op in ops {
+            assert_eq!(Op::decode(&op.encode()).unwrap(), op);
+        }
+    }
+
+    #[test]
+    fn op_decode_rejects_bad_input() {
+        //empty input
+        assert!(matches!(Op::decode(&[]), Err(FileError::CorruptedData)));
+        // unknown header
+        assert!(matches!(
+            Op::decode(&[9, 1, 2]),
+            Err(FileError::CorruptedData)
+        ));
+        // set with fewer than 4 length bytes
+        assert!(matches!(
+            Op::decode(&[1, 0, 0]),
+            Err(FileError::CorruptedData)
+        ));
+    }
+    // KvStore Behaviour tests
+
+    #[test]
+    fn open_missing_file_gives_empty_store() {
+        let path = temp_path("missing.log");
+        let store = KvStore::open(&path).unwrap();
+        assert_eq!(store.get(b"anything"), None);
+    }
+
+    #[test]
+    fn open_empty_file_gives_empty_store() {
+        let path = temp_path("empty_store.log");
+        fs::write(&path, b"").unwrap();
+
+        let store = KvStore::open(&path).unwrap();
+        assert_eq!(store.get(b"anything"), None);
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn delete_missing_key_is_ok() {
+        let p = temp_path("missing.log");
+
+        let mut s = KvStore::open(&p).unwrap();
+        s.delete(b"never_existed").unwrap();
+        assert_eq!(s.get(b"never_existed"), None);
+
+        fs::remove_file(&p).unwrap();
+    }
+
+    #[test]
+    fn overwrite_keeps_latest_value() {
+        let path = temp_path("overwrite.log");
+
+        {
+            let mut s = KvStore::open(&path).unwrap();
+            s.set(b"wow", b"wow value").unwrap();
+            s.set(b"wow", b"wow value changed").unwrap();
+            assert_eq!(s.get(b"wow"), Some(b"wow value changed".as_slice()));
+        }
+
+        let s = KvStore::open(&path).unwrap();
+
+        assert_eq!(s.get(b"wow"), Some(b"wow value changed".as_slice()));
+
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn empty_value_is_not_same_as_missing() {
+        let path = temp_path("overwrite.log");
+
+        {
+            let mut s = KvStore::open(&path).unwrap();
+            s.set(b"wow", b"").unwrap();
+        }
+
+        let s = KvStore::open(&path).unwrap();
+        assert_eq!(s.get(b"wow"), Some(b"".as_slice())); // Some(empty) not 'None'
+
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn torn_update_brings_back_old_value() {
+        let path = temp_path("torn_update.log");
+
+        {
+            let mut s = KvStore::open(&path).unwrap();
+            s.set(b"key1", b"val1").unwrap();
+            s.set(b"key1", b"val2").unwrap();
+        }
+
+        let len = fs::metadata(&path).unwrap().len();
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+
+        file.set_len(len - 3).unwrap();
+        let s = KvStore::open(&path).unwrap();
+
+        assert_eq!(s.get(b"key1"), Some(b"val1".as_slice()));
+
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn damage_in_the_middle_is_corrupted_data() {
+        let path = temp_path("torn_update.log");
+
+        {
+            let mut s = KvStore::open(&path).unwrap();
+            s.set(b"key1", b"val1").unwrap();
+            s.set(b"key2", b"val2").unwrap();
+            s.set(b"key3", b"val3").unwrap();
+        }
+
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[8] ^= 0xFF;
+
+        fs::write(&path, bytes).unwrap();
+
+        assert!(matches!(
+            KvStore::open(&path),
+            Err(FileError::CorruptedData)
+        ));
 
         fs::remove_file(&path).unwrap();
     }
