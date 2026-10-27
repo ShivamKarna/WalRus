@@ -13,6 +13,7 @@ pub enum FileError {
     InvalidUtf8,
     FileAlreadyExists(String),
     ThreadPanic(String),
+    EntryTooLarge,
 }
 
 impl fmt::Display for FileError {
@@ -42,6 +43,7 @@ impl fmt::Display for FileError {
                     msg
                 )
             }
+            FileError::EntryTooLarge => write!(f, "entry is larger than the maximum allowed size"),
         }
     }
 }
