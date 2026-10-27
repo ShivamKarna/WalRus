@@ -1,87 +1,117 @@
 # walrus
 
-_WAL + Rust = walrus_
+A small key-value store in Rust. Data lives in a `HashMap`. A write-ahead log (WAL) on disk lets it survive restarts and crashes.
 
-A small key-value store in Rust that keeps its data in a HashMap and uses a
-write-ahead log (WAL) so the data is not lost when the program stops.
+A learning project, not for production use.
 
-I made this to learn how a WAL works. It is a learning project, not for real use.
+## Contents
 
-## What it does
+- [Usage](#usage)
+  - [Library](#library)
+  - [CLI](#cli)
+- [Design](#design)
+  - [Write path](#write-path)
+  - [Recovery](#recovery)
+  - [Log format](#log-format)
+  - [Layers](#layers)
+- [Guarantees and limits](#guarantees-and-limits)
+- [Tests](#tests)
 
-- `set(key, value)` and `delete(key)` first write the change to a log file,
-  then update the HashMap.
-- `get(key)` reads from the HashMap.
-- When you open the store again, it reads the log from the start and
-  rebuilds the HashMap.
-- Each log entry has a CRC checksum, so a damaged entry is detected.
-- If the last entry was cut off (like in a crash), it is removed when the
-  store opens, so new writes don't go after broken bytes.
-- Every write calls `sync_all`, so the entry is on disk before `set` returns.
+## Usage
 
-## Example
+### Library
 
 ```rust
 use walrus::kv_store::KvStore;
 
 let mut db = KvStore::open("data.log")?;
 db.set(b"name", b"walrus")?;
-db.set(b"lang", b"rust")?;
-db.delete(b"lang")?;
-
-// close the program, run it again
-
-let db = KvStore::open("data.log")?;
 assert_eq!(db.get(b"name"), Some(b"walrus".as_slice()));
-assert_eq!(db.get(b"lang"), None);
+db.delete(b"name")?;
 ```
 
-## How the log file looks
+Keys and values are arbitrary bytes. `open` creates the log if it does not exist.
 
-Two layers.
-
-**Log entry** (`file.rs`), numbers are big-endian:
+### CLI
 
 ```
-[crc: 4 bytes][len: 4 bytes][payload: len bytes]
+cargo run -- set <key> <value>
+cargo run -- get <key>
+cargo run -- delete <key>
+cargo run -- dump            # print every log entry, repairs nothing
+cargo run -- chop <n>        # cut n bytes off the log (simulate a crash)
+cargo run -- flip <pos>      # flip one byte (simulate damage)
 ```
 
-The crc is calculated over `len` and `payload`. Entries are written one after
-another.
+```
+$ cargo run -- set name walrus
+$ cargo run -- set lang rust
+$ cargo run -- delete lang
+$ cargo run -- dump
+0: Set(name => walrus)
+1: Set(lang => rust)
+2: Delete(lang)
+entries: 3, valid bytes: 57, file bytes: 57, tail: Clean
+```
 
-**Operation** (`kv_store.rs`), this goes inside the payload:
+## Design
+
+The map in memory is the working copy. The log on disk is the source of truth. The map can always be rebuilt from the log, never the other way round.
+
+### Write path
+
+`set` and `delete` do two things, in a fixed order:
+
+1. Append the operation to the log and call `sync_all`.
+2. Apply the operation to the map.
+
+If step 1 fails, the function returns early and the map is untouched, so memory never holds a change the log doesn't. If the process dies between the two steps, the change is in the log and is applied on the next `open`. Reads (`get`) only touch the map.
+
+Both normal writes and recovery go through the same `apply` function, so the two paths can't behave differently.
+
+### Recovery
+
+`open` reads the log from the start with `scan`, which stops at one of three outcomes:
+
+| Outcome                                                         | Meaning              | What `open` does                                                       |
+| --------------------------------------------------------------- | -------------------- | ---------------------------------------------------------------------- |
+| End of file at an entry boundary                                | clean log            | replays all entries                                                    |
+| End of file in the middle of an entry                           | crash during a write | truncates the file to the end of the last complete entry, then replays |
+| A complete entry fails its checksum or has an impossible length | damage               | returns `CorruptedData`, changes nothing                               |
+
+Truncating a cut-off entry is what makes later writes safe. Without it, new entries would land after the broken bytes and never be read back.
+
+An entry that was cut off was never acknowledged, because `set` only returns `Ok` after the sync. Dropping it breaks no promise.
+
+### Log format
+
+Big-endian. The CRC covers `len` and `payload`, so a damaged length is detected too.
 
 ```
-Set    = [1][key_len: 4 bytes][key][value]
-Delete = [2][key]
+entry   = [crc: u32][len: u32][payload: len bytes]
+payload = Set    [1][key_len: u32][key][value]
+        | Delete [2][key]
 ```
 
-## What happens when opening
+`len` is capped at 16 MB. The cap is checked before any allocation, so a corrupted length can't trigger a huge allocation, and it is also enforced on write, so the log can never contain an entry it refuses to read.
 
-1. `scan` reads entries one by one until the end of the file.
-2. If the file ends in the middle of an entry, the file is cut back to the end
-   of the last good entry.
-3. If a full entry has a wrong checksum, `open` returns `CorruptedData`. It does
-   not try to fix it.
-4. Each good entry is decoded and applied to a new HashMap, in order.
+### Layers
 
-## Run tests
+- `file.rs`: entries only. It frames bytes, checksums them, appends them, and scans them back. It knows nothing about what the payload means.
+- `kv_store.rs`: defines the operations (`Op`), encodes them into payloads, and owns the map.
+
+## Guarantees and limits
+
+- Once `set` or `delete` returns `Ok`, the entry has been synced to disk.
+- If the log ends in a partial entry (a crash during a write), `open` truncates it. Everything before it is kept.
+- If a complete entry fails its checksum, `open` returns `CorruptedData`. It does not skip or repair.
+- Entries larger than 16 MB are rejected on write.
+- One process per log file. There is no locking.
+- The log only grows. There is no compaction.
+- Crash behavior is tested by truncating and corrupting the file, not by power-loss testing.
+
+## Tests
 
 ```
 cargo test
 ```
-
-Tests use temp files, one file per test. They cover: round trip of entries,
-torn entries, flipped bytes, and data surviving a reopen.
-
-## Not done / known problems
-
-- `set` can write an entry bigger than `MAX_ENTRY_SIZE` (16 MB), and then the
-  next `open` fails because `scan` rejects it. It should refuse it in `set`.
-- If a write fails halfway, the broken bytes stay in the file and the next
-  write goes after them.
-- The file is opened and closed on every write. It is slow.
-- The log only grows. There is no compaction or snapshot or checkpoints.
-- No transactions. Each `set` is its own change.
-- Only one process should use a log file. There is no file lock.
-- I only tested crashes by cutting bytes off the file, not real power loss.
