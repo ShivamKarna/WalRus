@@ -25,11 +25,11 @@ impl fmt::Debug for Op {
         match self {
             Op::Set { key, val } => write!(
                 f,
-                "Set({} => {}",
+                "Set({} => {})",
                 String::from_utf8_lossy(key),
                 String::from_utf8_lossy(val)
             ),
-            Op::Delete { key } => write!(f, "Delete({})", String::from_utf8_lossy(key),),
+            Op::Delete { key } => write!(f, "Delete({})", String::from_utf8_lossy(key)),
         }
     }
 }
@@ -147,6 +147,8 @@ impl KvStore {
 
 #[cfg(test)]
 mod test {
+    use crate::file::MAX_ENTRY_SIZE;
+
     use super::*;
     use std::fs::{self};
 
@@ -266,7 +268,7 @@ mod test {
 
     #[test]
     fn open_missing_file_gives_empty_store() {
-        let path = temp_path("missing.log");
+        let path = temp_path("open_missing.log");
         let store = KvStore::open(&path).unwrap();
         assert_eq!(store.get(b"anything"), None);
     }
@@ -283,7 +285,7 @@ mod test {
 
     #[test]
     fn delete_missing_key_is_ok() {
-        let p = temp_path("missing.log");
+        let p = temp_path("delete_missing.log");
 
         let mut s = KvStore::open(&p).unwrap();
         s.delete(b"never_existed").unwrap();
@@ -294,7 +296,7 @@ mod test {
 
     #[test]
     fn overwrite_keeps_latest_value() {
-        let path = temp_path("overwrite.log");
+        let path = temp_path("overwrite_keeps_latest.log");
 
         {
             let mut s = KvStore::open(&path).unwrap();
@@ -312,7 +314,7 @@ mod test {
 
     #[test]
     fn empty_value_is_not_same_as_missing() {
-        let path = temp_path("overwrite.log");
+        let path = temp_path("empty_value_is_not_missing.log");
 
         {
             let mut s = KvStore::open(&path).unwrap();
@@ -348,7 +350,7 @@ mod test {
 
     #[test]
     fn damage_in_the_middle_is_corrupted_data() {
-        let path = temp_path("torn_update.log");
+        let path = temp_path("damaged_in_middle.log");
 
         {
             let mut s = KvStore::open(&path).unwrap();
@@ -366,6 +368,45 @@ mod test {
             KvStore::open(&path),
             Err(FileError::CorruptedData)
         ));
+
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn oversized_value_is_rejected_at_write_time() {
+        let path = temp_path("oversized_value.log");
+
+        let mut s = KvStore::open(&path).unwrap();
+
+        s.set(b"k", b"ok").unwrap();
+
+        let huge = vec![0u8; MAX_ENTRY_SIZE + 1];
+        assert!(matches!(s.set(b"c", &huge), Err(FileError::EntryTooLarge)));
+
+        drop(s);
+
+        let s = KvStore::open(&path).unwrap();
+        assert_eq!(s.get(b"c"), None);
+        assert_eq!(s.get(b"k"), Some(b"ok".as_slice()));
+
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn largest_allowed_entry_roundtrip() {
+        let path = temp_path("largest.log");
+        let key = b"k";
+
+        // payload = tag 1 + key_len 4(BE) + key + value , it must be exactly MAX_ENTRY_SIZE
+        let val = vec![7u8; MAX_ENTRY_SIZE - 1 - 4 - key.len()];
+
+        {
+            let mut st = KvStore::open(&path).unwrap();
+            st.set(key, &val).unwrap();
+        }
+
+        let s = KvStore::open(&path).unwrap();
+        assert_eq!(s.get(key), Some(val.as_slice()));
 
         fs::remove_file(&path).unwrap();
     }
