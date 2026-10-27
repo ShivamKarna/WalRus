@@ -6,8 +6,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
 
 // Constants
-const MAX_ENTRY_SIZE: usize = 16 * 1024 * 1024;
-const HEADER_LEN: usize = 8; // crc (4 bytes) + len(4 bytes) ,
+pub const MAX_ENTRY_SIZE: usize = 16 * 1024 * 1024;
+pub const HEADER_LEN: usize = 8; // crc (4 bytes) + len(4 bytes) ,
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct LogEntry {
@@ -175,8 +175,10 @@ pub fn create_new_file(file_path: &str, content: &[u8]) -> Result<(), FileError>
 
 // core functions
 pub fn append_entry(path: &str, entry: &LogEntry) -> Result<(), FileError> {
-    let serialized_entry = entry.serialize();
-    append_to_file(path, &serialized_entry)
+    if entry.payload().len() > MAX_ENTRY_SIZE {
+        return Err(FileError::EntryTooLarge);
+    }
+    append_to_file(path, &entry.serialize())
 }
 
 pub fn read_entries(path: &str) -> Result<Vec<LogEntry>, FileError> {
