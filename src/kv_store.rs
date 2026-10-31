@@ -1,5 +1,6 @@
 use std::fmt;
-use std::{collections::HashMap, fs::OpenOptions, path::Path};
+use std::ops::Bound;
+use std::{collections::BTreeMap, fs::OpenOptions, path::Path};
 
 use crate::{
     errors::FileError,
@@ -79,7 +80,7 @@ impl Op {
     }
 }
 
-fn apply(map: &mut HashMap<Vec<u8>, Vec<u8>>, op: Op) {
+fn apply(map: &mut BTreeMap<Vec<u8>, Vec<u8>>, op: Op) {
     match op {
         Op::Set { key, val } => {
             map.insert(key, val);
@@ -92,12 +93,12 @@ fn apply(map: &mut HashMap<Vec<u8>, Vec<u8>>, op: Op) {
 
 pub struct KvStore {
     path: String,
-    map: HashMap<Vec<u8>, Vec<u8>>,
+    map: BTreeMap<Vec<u8>, Vec<u8>>,
 }
 
 impl KvStore {
     pub fn open(path: &str) -> Result<KvStore, FileError> {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
 
         if Path::new(path).exists() {
             let result = scan(path)?;
@@ -142,6 +143,17 @@ impl KvStore {
 
     pub fn get(&self, key: &[u8]) -> Option<&[u8]> {
         self.map.get(key).map(|v| v.as_slice())
+    }
+
+    pub fn scan_range(&self, start: &[u8], end: &[u8]) -> Vec<(&[u8], &[u8])> {
+        if start > end {
+            return Vec::new();
+        }
+
+        self.map
+            .range::<[u8], _>((Bound::Included(start), Bound::Excluded(end)))
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect()
     }
 }
 
@@ -407,6 +419,32 @@ mod test {
 
         let s = KvStore::open(&path).unwrap();
         assert_eq!(s.get(key), Some(val.as_slice()));
+
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn scan_range_returns_half_open_range() {
+        let path = temp_path("scan_range.log");
+        let mut s = KvStore::open(&path).unwrap();
+
+        for k in [b"a", b"b", b"c", b"d"] {
+            s.set(k, b"v").unwrap();
+        }
+
+        let got: Vec<&[u8]> = s
+            .scan_range(b"b".as_slice(), b"d".as_slice())
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+
+        assert_eq!(got, vec![b"b".as_slice(), b"c".as_slice()]);
+
+        assert!(s.scan_range(b"d", b"b").is_empty()); // start > end
+
+        assert!(s.scan_range(b"b", b"b").is_empty()); // start == end
+
+        drop(s);
 
         fs::remove_file(&path).unwrap();
     }
