@@ -20,6 +20,20 @@ impl Bst {
             self.len += 1;
         }
     }
+
+    pub fn get(&self, key: &[u8]) -> Option<&[u8]> {
+        let mut current = &self.root;
+
+        while let Some(node) = current {
+            match key.cmp(node.key.as_slice()) {
+                std::cmp::Ordering::Greater => current = &node.right,
+                std::cmp::Ordering::Less => current = &node.left,
+                std::cmp::Ordering::Equal => return Some(node.val.as_slice()),
+            }
+        }
+
+        None
+    }
 }
 
 // returns true if a new node was added, false if an existing key was updated
@@ -59,6 +73,7 @@ mod test {
         t.insert(b"k", b"2");
 
         assert_eq!(t.len, 1);
+        assert_eq!(t.get(b"k"), Some(b"2".as_slice()));
     }
 
     #[test]
@@ -76,5 +91,23 @@ mod test {
         assert_eq!(root.right.as_ref().unwrap().key, b"c");
 
         assert_eq!(t.len, 3);
+    }
+
+    #[test]
+    fn get_finds_keys_on_both_sides() {
+        let mut t = Bst::new();
+        t.insert(b"b", b"1");
+        t.insert(b"a", b"2");
+        t.insert(b"c", b"3");
+
+        assert_eq!(t.get(b"a"), Some(b"2".as_slice()));
+        assert_eq!(t.get(b"b"), Some(b"1".as_slice()));
+        assert_eq!(t.get(b"c"), Some(b"3".as_slice()));
+        assert_eq!(t.get(b"zzz"), None);
+    }
+
+    #[test]
+    fn get_on_empty_tree_is_none() {
+        assert_eq!(Bst::new().get(b"x"), None);
     }
 }
